@@ -1,0 +1,3 @@
+# MOTOSEC 237 v0.1 — serveur en ligne (Python 3.12, rien à compiler).
+fastapi==0.115.6
+uvicorn==0.32.1

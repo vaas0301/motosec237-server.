@@ -1,0 +1,43 @@
+# MOTOSEC 237 — déploiement en un clic sur Render (offre gratuite).
+# Comment l'utiliser :
+#   1. Poussez ce dépôt (server/, db/, docs/, render.yaml) sur GitHub.
+#   2. Sur Render : New + > Blueprint > choisissez le dépôt.
+#   3. Render demande les 2 valeurs marquées sync: false :
+#        MOTOSEC_PAIRING_CODE : code d'enregistrement des appareils
+#          (6 chiffres, à garder secret, à taper dans l'appli).
+#        GOOGLE_MAPS_API_KEY : clé serveur Google, restreinte à
+#          l'API Directions (voir docs/GOOGLE-MAPS.md). Peut être
+#          ajoutée plus tard : sans elle, /maps/route répond 503 et
+#          l'appli retombe sur la ligne droite.
+#   4. Render donne une URL https://motosec237-server.onrender.com :
+#        curl https://motosec237-server.onrender.com/health
+#        doit répondre {"status":"ok","version":"0.2.0","mode":"online",...}
+#   5. Dans l'appli : flutter run --dart-define=MOTOSEC_BASE_URL=<url>
+#
+# Offre gratuite Render : le service s'endort après inactivité, le
+# premier appel est lent (quelques dizaines de secondes). C'est normal
+# sur l'offre gratuite, pas un bug. La base SQLite est un fichier sur
+# le disque du service : sauvegardez motosec237.db régulièrement, et
+# prévoyez la bascule PostgreSQL avant de dépasser le pilote de Meiganga
+# (voir docs/BASE-DONNEES.md).
+# Ne JAMAIS mettre de secret dans ce fichier : SECRET_KEY est généré par
+# Render, les autres valeurs sont saisies dans le tableau de bord.
+services:
+  - type: web
+    name: motosec237-server
+    runtime: python
+    rootDir: server
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    plan: free
+    envVars:
+      - key: DATABASE_URL
+        value: sqlite:///./motosec237.db
+      - key: SECRET_KEY
+        generateValue: true
+      - key: MOTOSEC_PAIRING_CODE
+        sync: false
+      - key: MOTOSEC_DEMO_OTP
+        value: "0"
+      - key: GOOGLE_MAPS_API_KEY
+        sync: false
