@@ -59,7 +59,7 @@ from pricing import (
     estimate_fare,
 )
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 BASE = Path(__file__).parent
 SCHEMA_PATH = BASE.parent / "db" / "schema.sql"
 
@@ -131,8 +131,35 @@ def init_db():
             conn.execute(f"ALTER TABLE drivers ADD COLUMN {col}")
         except sqlite3.OperationalError:
             pass  # colonne déjà présente
+    # v0.3 — circuit conducteur : en ligne / hors ligne, motif de refus.
+    for col in ("online INTEGER NOT NULL DEFAULT 0", "rejection_reason TEXT"):
+        try:
+            conn.execute(f"ALTER TABLE drivers ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass  # colonne déjà présente
+    # v0.3 — code boîtier du traqueur, unique quand il est renseigné
+    # (NULL autorisé plusieurs fois : une moto sans boîtier reste possible).
+    # SQLite REFUSE « UNIQUE » dans ALTER TABLE ADD COLUMN : on ajoute la
+    # colonne simple, puis un index unique séparé (les NULL restent
+    # autorisés en plusieurs exemplaires dans un index unique).
+    try:
+        conn.execute("ALTER TABLE motorcycles ADD COLUMN box_code TEXT")
+    except sqlite3.OperationalError:
+        pass  # colonne déjà présente
+    try:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_motorcycles_box_code "
+            "ON motorcycles(box_code)")
+    except sqlite3.OperationalError:
+        pass  # index déjà présent
     conn.commit()
     conn.close()
+
+
+# v0.3 — une position « en ligne » n'est valable que 10 minutes : un
+# conducteur qui oublie de se mettre hors ligne disparaît tout seul de
+# /drivers/nearby après ce délai (le marqueur ne reste pas figé).
+ONLINE_FRESH_SECONDS = 600
 
 
 init_db()
@@ -169,6 +196,101 @@ def _require_device(token):
     if row is None:
         raise HTTPException(status_code=401, detail="Appareil non enregistré ou révoqué.")
     return row
+
+
+# ------------------------------------------------------- circuit conducteur
+def _fresh(last_seen_at):
+    """Vrai si la dernière position connue date de moins de 10 minutes.
+
+    Une position périmée n'est plus « en ligne » : le conducteur a coupé
+    l'appli, perdu le réseau, ou oublié de se mettre hors ligne.
+    """
+    if not last_seen_at:
+        return False
+    try:
+        seen = datetime.fromisoformat(last_seen_at)
+    except ValueError:
+        return False
+    if seen.tzinfo is None:
+        seen = seen.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - seen).total_seconds()
+    return 0 <= age <= ONLINE_FRESH_SECONDS
+
+
+def _driver_by_id(conn, driver_id):
+    return conn.execute("SELECT * FROM drivers WHERE id = ?", (driver_id,)).fetchone()
+
+
+def _driver_by_user(conn, user_id):
+    return conn.execute("SELECT * FROM drivers WHERE user_id = ?", (user_id,)).fetchone()
+
+
+def _driver_motorcycles(conn, driver_id):
+    rows = conn.execute(
+        "SELECT * FROM motorcycles WHERE driver_id = ? ORDER BY created_at",
+        (driver_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _moto_for_driver(conn, driver_id):
+    """Première moto VÉRIFIÉE du conducteur (la plus ancienne) : c'est
+    celle qui est attribuée à la course quand le client choisit ce
+    conducteur. None s'il n'en a aucune."""
+    row = conn.execute(
+        "SELECT * FROM motorcycles WHERE driver_id = ? AND verified = 1 "
+        "ORDER BY created_at LIMIT 1", (driver_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def _touch_driver_position(conn, driver_id, lat, lng):
+    """Met à jour la dernière position connue du conducteur.
+
+    Un conducteur VÉRIFIÉ qui publie sa position passe en ligne (c'est
+    comme ça qu'il se signale disponible). Un dossier en attente, refusé
+    ou suspendu ne passe jamais en ligne, même s'il publie une position.
+    """
+    row = _driver_by_id(conn, driver_id)
+    if row is None:
+        return False
+    online = 1 if row["status"] == "verified" else row["online"]
+    conn.execute(
+        "UPDATE drivers SET last_lat=?, last_lng=?, last_seen_at=?, online=? "
+        "WHERE id=?",
+        (lat, lng, _now(), online, driver_id),
+    )
+    return True
+
+
+def _driver_public(conn, driver_row, distance_km=None):
+    """Ce que le CLIENT voit d'un conducteur pour choisir (v0.3) : nom,
+    note, distance, et ses motos vérifiées (plaque, marque, modèle,
+    couleur). Aucun document, aucun téléphone, aucune position exacte
+    au-delà de la distance."""
+    user = conn.execute(
+        "SELECT full_name, phone FROM app_users WHERE id = ?",
+        (driver_row["user_id"],)).fetchone()
+    motos = [m for m in _driver_motorcycles(conn, driver_row["id"]) if m["verified"]]
+    out = {
+        "id": driver_row["id"],
+        "name": user["full_name"] if user else "Conducteur",
+        "rating_avg": driver_row["rating_avg"],
+        "distance_km": distance_km,
+        "motorcycles": [
+            {"id": m["id"], "plate": m["plate"], "brand": m["brand"],
+             "model": m["model"], "color": m["color"]}
+            for m in motos
+        ],
+    }
+    return out
+
+
+def _norm_plate(plate):
+    return (plate or "").strip().upper()
+
+
+def _norm_box_code(box_code):
+    code = (box_code or "").strip()
+    return code or None
 
 
 # ------------------------------------------------------------------ modèles
@@ -227,6 +349,43 @@ class RidePositionIn(BaseModel):
     lng: float
     accuracy_m: float | None = None
     speed_kmh: float | None = None
+
+
+# v0.3 — circuit conducteur (inscription, vérification, choix, « J'arrive »).
+class MotorcycleIn(BaseModel):
+    plate: str
+    brand: str = ""
+    model: str = ""
+    color: str = ""
+    box_code: str | None = None
+    owner_name: str = ""
+
+
+class DriverRegisterIn(BaseModel):
+    user_id: str  # téléphone du motoman (identifiant utilisateur)
+    full_name: str = ""
+    id_document_type: str = ""  # CNI ou passeport
+    id_document_ref: str = ""
+    licence_number: str = ""
+    motorcycle: MotorcycleIn
+
+
+class VerifyIn(BaseModel):
+    pairing_code: str  # code d'appairage : validation réservée à l'admin
+    decision: str  # "verified" ou "rejected"
+    reason: str = ""
+
+
+class OnlineIn(BaseModel):
+    online: bool
+
+
+class ChooseDriverIn(BaseModel):
+    driver_id: str
+
+
+class DriverActionIn(BaseModel):
+    driver_id: str
 
 
 # ------------------------------------------------------------------ endpoints
@@ -400,6 +559,12 @@ def list_rides(x_device_token: str | None = Header(default=None)):
 @app.post("/rides")
 def create_ride(body: RideCreateIn, x_device_token: str | None = Header(default=None)):
     _require_device(x_device_token)
+    # v0.3 — décision utilisateur : paiement en espèces UNIQUEMENT (pas
+    # de MTN MoMo ni Orange Money). Toute autre méthode est refusée.
+    if body.payment_method != "cash":
+        raise HTTPException(
+            status_code=400,
+            detail="Paiement en espèces (cash) uniquement.")
     distance = haversine_km(body.origin_lat, body.origin_lng, body.dest_lat, body.dest_lng)
     fare = estimate_fare(distance, body.duration_min)
     ride_id = str(uuid.uuid4())
@@ -427,6 +592,163 @@ def get_ride(ride_id: str, x_device_token: str | None = Header(default=None)):
     conn.close()
     if row is None:
         raise HTTPException(status_code=404, detail="Course introuvable.")
+    return dict(row)
+
+
+@app.post("/rides/{ride_id}/request")
+def request_ride(ride_id: str, x_device_token: str | None = Header(default=None)):
+    """Le client publie sa course (draft -> requested) : elle devient
+    visible des conducteurs en ligne (GET /drivers/requests) et le
+    client peut choisir un conducteur (POST /rides/{id}/choose-driver)."""
+    _require_device(x_device_token)
+    conn = get_db()
+    ride = conn.execute("SELECT * FROM rides WHERE id = ?", (ride_id,)).fetchone()
+    if ride is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Course introuvable.")
+    if ride["status"] != "draft":
+        conn.close()
+        raise HTTPException(
+            status_code=409,
+            detail=f"Course déjà publiée (statut : {ride['status']}).")
+    conn.execute(
+        "UPDATE rides SET status='requested', updated_at=? WHERE id=?",
+        (_now(), ride_id))
+    conn.execute(
+        "INSERT INTO ride_events (ride_id, op_id, event_type, detail, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (ride_id, str(uuid.uuid4()), "ride_requested", "", _now()))
+    conn.commit()
+    row = conn.execute("SELECT * FROM rides WHERE id = ?", (ride_id,)).fetchone()
+    conn.close()
+    return dict(row)
+
+
+@app.post("/rides/{ride_id}/choose-driver")
+def choose_driver(ride_id: str, body: ChooseDriverIn,
+                  x_device_token: str | None = Header(default=None)):
+    """Le client choisit le conducteur qui viendra (v0.3).
+
+    Attribution atomique : une seule mise à jour conditionnelle
+    (statut 'requested' ET aucun conducteur déjà choisi). Si deux
+    clients choisissent en même temps, un seul gagne, l'autre reçoit
+    409. Le conducteur doit être vérifié, en ligne avec une position
+    fraîche, avoir une moto vérifiée, et ne pas être déjà engagé sur
+    une autre course (requested avec conducteur, assigned, ongoing).
+    La course reste 'requested' : c'est le conducteur qui confirme
+    ensuite avec POST /rides/{id}/accept (« J'arrive »)."""
+    _require_device(x_device_token)
+    conn = get_db()
+    ride = conn.execute("SELECT * FROM rides WHERE id = ?", (ride_id,)).fetchone()
+    if ride is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Course introuvable.")
+    driver = _driver_by_id(conn, body.driver_id)
+    if driver is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Conducteur introuvable.")
+    if ride["status"] != "requested" or ride["driver_id"] is not None:
+        conn.close()
+        raise HTTPException(
+            status_code=409,
+            detail="Course déjà attribuée ou non demandée.")
+    if driver["status"] != "verified":
+        conn.close()
+        raise HTTPException(
+            status_code=409, detail="Conducteur non vérifié.")
+    if not driver["online"] or not _fresh(driver["last_seen_at"]):
+        conn.close()
+        raise HTTPException(
+            status_code=409, detail="Conducteur hors ligne pour le moment.")
+    busy = conn.execute(
+        "SELECT id FROM rides WHERE driver_id = ? AND status IN "
+        "('requested','assigned','ongoing') LIMIT 1",
+        (body.driver_id,)).fetchone()
+    if busy is not None:
+        conn.close()
+        raise HTTPException(
+            status_code=409,
+            detail="Conducteur déjà engagé sur une autre course.")
+    moto = _moto_for_driver(conn, body.driver_id)
+    if moto is None:
+        conn.close()
+        raise HTTPException(
+            status_code=409,
+            detail="Conducteur sans moto vérifiée.")
+    cur = conn.execute(
+        "UPDATE rides SET driver_id=?, motorcycle_id=?, updated_at=? "
+        "WHERE id=? AND status='requested' AND driver_id IS NULL",
+        (body.driver_id, moto["id"], _now(), ride_id))
+    if cur.rowcount != 1:
+        conn.close()
+        raise HTTPException(
+            status_code=409, detail="Course déjà attribuée à un autre conducteur.")
+    conn.execute(
+        "INSERT INTO ride_events (ride_id, op_id, event_type, detail, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (ride_id, str(uuid.uuid4()), "driver_chosen", body.driver_id, _now()))
+    conn.commit()
+    row = conn.execute("SELECT * FROM rides WHERE id = ?", (ride_id,)).fetchone()
+    conn.close()
+    return dict(row)
+
+
+@app.post("/rides/{ride_id}/accept")
+def accept_ride(ride_id: str, body: DriverActionIn,
+                x_device_token: str | None = Header(default=None)):
+    """Le conducteur CHOISI confirme : « J'arrive » (v0.3). La course
+    passe en 'assigned'. Seul le conducteur choisi peut accepter."""
+    _require_device(x_device_token)
+    conn = get_db()
+    ride = conn.execute("SELECT * FROM rides WHERE id = ?", (ride_id,)).fetchone()
+    if ride is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Course introuvable.")
+    if ride["status"] != "requested" or ride["driver_id"] != body.driver_id:
+        conn.close()
+        raise HTTPException(
+            status_code=409,
+            detail="Cette course ne vous est pas proposée.")
+    conn.execute(
+        "UPDATE rides SET status='assigned', updated_at=? WHERE id=?",
+        (_now(), ride_id))
+    conn.execute(
+        "INSERT INTO ride_events (ride_id, op_id, event_type, detail, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (ride_id, str(uuid.uuid4()), "driver_accepted", body.driver_id, _now()))
+    conn.commit()
+    row = conn.execute("SELECT * FROM rides WHERE id = ?", (ride_id,)).fetchone()
+    conn.close()
+    return dict(row)
+
+
+@app.post("/rides/{ride_id}/decline")
+def decline_ride(ride_id: str, body: DriverActionIn,
+                 x_device_token: str | None = Header(default=None)):
+    """Le conducteur CHOISI refuse : la course redevient 'requested'
+    sans conducteur, le client peut choisir un autre conducteur (v0.3).
+    Seul le conducteur choisi peut refuser."""
+    _require_device(x_device_token)
+    conn = get_db()
+    ride = conn.execute("SELECT * FROM rides WHERE id = ?", (ride_id,)).fetchone()
+    if ride is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Course introuvable.")
+    if ride["status"] != "requested" or ride["driver_id"] != body.driver_id:
+        conn.close()
+        raise HTTPException(
+            status_code=409,
+            detail="Cette course ne vous est pas proposée.")
+    conn.execute(
+        "UPDATE rides SET driver_id=NULL, motorcycle_id=NULL, updated_at=? "
+        "WHERE id=?", (_now(), ride_id))
+    conn.execute(
+        "INSERT INTO ride_events (ride_id, op_id, event_type, detail, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (ride_id, str(uuid.uuid4()), "driver_declined", body.driver_id, _now()))
+    conn.commit()
+    row = conn.execute("SELECT * FROM rides WHERE id = ?", (ride_id,)).fetchone()
+    conn.close()
     return dict(row)
 
 
@@ -478,10 +800,9 @@ def ride_position(ride_id: str, body: RidePositionIn,
         (ride_id, body.lat, body.lng, body.accuracy_m, body.speed_kmh, _now()),
     )
     if ride["driver_id"]:
-        conn.execute(
-            "UPDATE drivers SET last_lat=?, last_lng=?, last_seen_at=? WHERE id=?",
-            (body.lat, body.lng, _now(), ride["driver_id"]),
-        )
+        # La position fraîche maintient le conducteur en ligne pendant
+        # la course (v0.3 : _touch_driver_position).
+        _touch_driver_position(conn, ride["driver_id"], body.lat, body.lng)
     conn.commit()
     conn.close()
     return {"ok": True}
@@ -516,34 +837,293 @@ def maps_route(origin_lat: float, origin_lng: float, dest_lat: float, dest_lng: 
 @app.post("/drivers/{driver_id}/position")
 def driver_position(driver_id: str, body: PositionIn,
                     x_device_token: str | None = Header(default=None)):
+    """Position du conducteur (mise en ligne / maintien en ligne, v0.3).
+
+    Un conducteur vérifié qui publie sa position passe en ligne. Un
+    dossier en attente, refusé ou suspendu ne passe jamais en ligne.
+    """
     _require_device(x_device_token)
+    if not (-90 <= body.lat <= 90 and -180 <= body.lng <= 180):
+        raise HTTPException(status_code=400, detail="Coordonnées hors limites.")
     conn = get_db()
-    cur = conn.execute(
-        "UPDATE drivers SET last_lat=?, last_lng=?, last_seen_at=? WHERE id=?",
-        (body.lat, body.lng, _now(), driver_id),
-    )
+    ok = _touch_driver_position(conn, driver_id, body.lat, body.lng)
     conn.commit()
     conn.close()
-    if cur.rowcount == 0:
+    if not ok:
         raise HTTPException(status_code=404, detail="Conducteur introuvable.")
     return {"ok": True}
+
+
+@app.post("/drivers/{driver_id}/online")
+def driver_online(driver_id: str, body: OnlineIn,
+                  x_device_token: str | None = Header(default=None)):
+    """Bascule « En ligne / Hors ligne » du conducteur (v0.3).
+
+    Seul un conducteur VÉRIFIÉ peut se mettre en ligne. Hors ligne, il
+    disparaît immédiatement de /drivers/nearby et des demandes.
+    """
+    _require_device(x_device_token)
+    conn = get_db()
+    driver = _driver_by_id(conn, driver_id)
+    if driver is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Conducteur introuvable.")
+    if body.online and driver["status"] != "verified":
+        conn.close()
+        raise HTTPException(
+            status_code=403,
+            detail="Seul un conducteur vérifié peut se mettre en ligne.")
+    conn.execute(
+        "UPDATE drivers SET online=?, updated_at=? WHERE id=?",
+        (1 if body.online else 0, _now(), driver_id))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "online": body.online}
 
 
 @app.get("/drivers/nearby")
 def drivers_nearby(lat: float, lng: float, radius_km: float = 5.0,
                    x_device_token: str | None = Header(default=None)):
+    """Conducteurs que le CLIENT peut choisir (v0.3) : vérifiés, en
+    ligne, avec une position fraîche (moins de 10 minutes). Chacun est
+    renvoyé avec son nom, sa note, sa distance et ses motos vérifiées
+    (plaque, marque, modèle, couleur) — de quoi choisir « celui qui
+    pourra venir ». Aucun conducteur inventé : liste vide s'il n'y en
+    a aucun."""
     _require_device(x_device_token)
     if not (-90 <= lat <= 90 and -180 <= lng <= 180):
         raise HTTPException(status_code=400, detail="Coordonnées hors limites.")
     conn = get_db()
     rows = conn.execute(
-        "SELECT id, last_lat, last_lng FROM drivers WHERE status='verified' "
+        "SELECT * FROM drivers WHERE status='verified' AND online=1 "
         "AND last_lat IS NOT NULL AND last_lng IS NOT NULL"
     ).fetchall()
+    fresh = [dict(r) for r in rows if _fresh(r["last_seen_at"])]
+    drivers = [{"id": r["id"], "lat": r["last_lat"], "lng": r["last_lng"]}
+               for r in fresh]
+    near = nearby_drivers(drivers, lat, lng, radius_km)
+    by_id = {r["id"]: r for r in fresh}
+    out = []
+    for n in near:
+        out.append(_driver_public(conn, by_id[n["id"]], n["distance_km"]))
     conn.close()
-    drivers = [{"id": r["id"], "lat": r["last_lat"], "lng": r["last_lng"]} for r in rows]
-    return {"drivers": nearby_drivers(drivers, lat, lng, radius_km),
-            "source": "positions_connues_seulement"}
+    return {"drivers": out, "source": "positions_connues_seulement"}
+
+
+@app.post("/drivers/register")
+def register_driver(body: DriverRegisterIn,
+                    x_device_token: str | None = Header(default=None)):
+    """Inscription d'un motoman (v0.3) : dossier conducteur + première
+    moto + documents. Statut initial 'pending' : c'est l'admin qui
+    vérifie ensuite (POST /drivers/{id}/verify). Un seul dossier par
+    utilisateur : si le dossier existe déjà, il est renvoyé tel quel
+    (la moto n'est pas ajoutée deux fois)."""
+    _require_device(x_device_token)
+    plate = _norm_plate(body.motorcycle.plate)
+    box_code = _norm_box_code(body.motorcycle.box_code)
+    if not body.user_id.strip():
+        raise HTTPException(status_code=400, detail="Numéro de téléphone obligatoire.")
+    if not plate:
+        raise HTTPException(status_code=400, detail="Plaque de la moto obligatoire.")
+    if not body.licence_number.strip():
+        raise HTTPException(status_code=400, detail="Numéro de permis obligatoire.")
+    if not body.id_document_ref.strip():
+        raise HTTPException(
+            status_code=400, detail="Numéro de la pièce d'identité obligatoire.")
+    conn = get_db()
+    existing = _driver_by_user(conn, body.user_id.strip())
+    if existing is not None:
+        motos = _driver_motorcycles(conn, existing["id"])
+        conn.close()
+        return {"already_registered": True, **dict(existing), "motorcycles": motos}
+    if conn.execute("SELECT id FROM motorcycles WHERE plate = ?", (plate,)).fetchone():
+        conn.close()
+        raise HTTPException(status_code=409, detail="Plaque déjà enregistrée.")
+    if box_code and conn.execute(
+            "SELECT id FROM motorcycles WHERE box_code = ?", (box_code,)).fetchone():
+        conn.close()
+        raise HTTPException(status_code=409, detail="Code boîtier déjà enregistré.")
+    _ensure_user(conn, body.user_id.strip())
+    if body.full_name.strip():
+        conn.execute(
+            "UPDATE app_users SET full_name=?, updated_at=? WHERE id=?",
+            (body.full_name.strip(), _now(), body.user_id.strip()))
+    driver_id = str(uuid.uuid4())
+    conn.execute(
+        "INSERT INTO drivers (id, user_id, status, id_document_type, "
+        "id_document_ref, licence_number, created_at, updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (driver_id, body.user_id.strip(), "pending", body.id_document_type.strip(),
+         body.id_document_ref.strip(), body.licence_number.strip(), _now(), _now()))
+    moto_id = str(uuid.uuid4())
+    conn.execute(
+        "INSERT INTO motorcycles (id, driver_id, plate, box_code, brand, model, "
+        "color, owner_name, verified, created_at, updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,0,?,?)",
+        (moto_id, driver_id, plate, box_code, body.motorcycle.brand.strip(),
+         body.motorcycle.model.strip(), body.motorcycle.color.strip(),
+         body.motorcycle.owner_name.strip() or body.full_name.strip(),
+         _now(), _now()))
+    _audit(conn, driver_id, "driver.register",
+           f"inscription conducteur user={body.user_id.strip()} plaque={plate}")
+    conn.commit()
+    row = _driver_by_id(conn, driver_id)
+    motos = _driver_motorcycles(conn, driver_id)
+    conn.close()
+    return {"already_registered": False, **dict(row), "motorcycles": motos}
+
+
+@app.get("/drivers/me")
+def my_driver_file(user_id: str, x_device_token: str | None = Header(default=None)):
+    """Mon dossier conducteur : profil + motos + statut + motif de
+    refus éventuel (v0.3). user_id = numéro de téléphone du motoman."""
+    _require_device(x_device_token)
+    conn = get_db()
+    driver = _driver_by_user(conn, user_id)
+    if driver is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Aucun dossier conducteur.")
+    motos = _driver_motorcycles(conn, driver["id"])
+    conn.close()
+    return {**dict(driver), "motorcycles": motos}
+
+
+@app.post("/drivers/{driver_id}/verify")
+def verify_driver(driver_id: str, body: VerifyIn,
+                  x_device_token: str | None = Header(default=None)):
+    """Validation admin du dossier conducteur (v0.3). Protégée par le
+    code d'appairage (même code que l'enregistrement des appareils) :
+    en attendant l'admin web (phase 9), c'est l'admin qui appelle cet
+    endpoint. 'verified' : dossier vérifié, rôle 'driver' dans
+    app_users, motos vérifiées. 'rejected' : dossier refusé, motif
+    conservé (rejection_reason), visible par le conducteur."""
+    _require_device(x_device_token)
+    if body.pairing_code != PAIRING_CODE:
+        raise HTTPException(status_code=403, detail="Code d'appairage invalide.")
+    if body.decision not in ("verified", "rejected"):
+        raise HTTPException(
+            status_code=400, detail="decision doit être 'verified' ou 'rejected'.")
+    conn = get_db()
+    driver = _driver_by_id(conn, driver_id)
+    if driver is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Conducteur introuvable.")
+    if body.decision == "verified":
+        conn.execute(
+            "UPDATE drivers SET status='verified', verified_at=?, "
+            "rejection_reason=NULL, updated_at=? WHERE id=?",
+            (_now(), _now(), driver_id))
+        conn.execute(
+            "UPDATE app_users SET role='driver', updated_at=? WHERE id=?",
+            (_now(), driver["user_id"]))
+        conn.execute(
+            "UPDATE motorcycles SET verified=1, updated_at=? WHERE driver_id=?",
+            (_now(), driver_id))
+        _audit(conn, driver_id, "driver.verify", "dossier vérifié")
+    else:
+        conn.execute(
+            "UPDATE drivers SET status='rejected', rejection_reason=?, "
+            "online=0, updated_at=? WHERE id=?",
+            (body.reason.strip(), _now(), driver_id))
+        conn.execute(
+            "UPDATE app_users SET role='client', updated_at=? WHERE id=?",
+            (_now(), driver["user_id"]))
+        _audit(conn, driver_id, "driver.verify",
+               f"dossier refusé : {body.reason.strip()}")
+    conn.commit()
+    row = _driver_by_id(conn, driver_id)
+    motos = _driver_motorcycles(conn, driver_id)
+    conn.close()
+    return {**dict(row), "motorcycles": motos}
+
+
+@app.post("/drivers/{driver_id}/motorcycles")
+def add_motorcycle(driver_id: str, body: MotorcycleIn,
+                   x_device_token: str | None = Header(default=None)):
+    """Ajouter une moto à son dossier (v0.3). Plaque unique, code
+    boîtier unique quand il est renseigné. Une moto ajoutée par un
+    conducteur DÉJÀ vérifié est marquée vérifiée (le conducteur est
+    de confiance après vérification) ; sinon elle attend la
+    vérification du dossier."""
+    _require_device(x_device_token)
+    plate = _norm_plate(body.plate)
+    box_code = _norm_box_code(body.box_code)
+    if not plate:
+        raise HTTPException(status_code=400, detail="Plaque de la moto obligatoire.")
+    conn = get_db()
+    driver = _driver_by_id(conn, driver_id)
+    if driver is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Conducteur introuvable.")
+    if conn.execute("SELECT id FROM motorcycles WHERE plate = ?", (plate,)).fetchone():
+        conn.close()
+        raise HTTPException(status_code=409, detail="Plaque déjà enregistrée.")
+    if box_code and conn.execute(
+            "SELECT id FROM motorcycles WHERE box_code = ?", (box_code,)).fetchone():
+        conn.close()
+        raise HTTPException(status_code=409, detail="Code boîtier déjà enregistré.")
+    moto_id = str(uuid.uuid4())
+    verified = 1 if driver["status"] == "verified" else 0
+    conn.execute(
+        "INSERT INTO motorcycles (id, driver_id, plate, box_code, brand, model, "
+        "color, owner_name, verified, created_at, updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (moto_id, driver_id, plate, box_code, body.brand.strip(),
+         body.model.strip(), body.color.strip(),
+         body.owner_name.strip(), verified, _now(), _now()))
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM motorcycles WHERE id = ?", (moto_id,)).fetchone()
+    conn.close()
+    return dict(row)
+
+
+@app.get("/drivers/{driver_id}/motorcycles")
+def list_motorcycles(driver_id: str, x_device_token: str | None = Header(default=None)):
+    _require_device(x_device_token)
+    conn = get_db()
+    driver = _driver_by_id(conn, driver_id)
+    if driver is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Conducteur introuvable.")
+    motos = _driver_motorcycles(conn, driver_id)
+    conn.close()
+    return {"motorcycles": motos}
+
+
+@app.get("/drivers/requests")
+def driver_requests(driver_id: str, x_device_token: str | None = Header(default=None)):
+    """Demandes de courses visibles par un conducteur vérifié (v0.3) :
+    les courses 'requested' sans conducteur (en attente du choix du
+    client) et celles qui lui sont proposées (chosen_for_me : c'est à
+    lui de dire « J'arrive » ou de refuser). Les courses proposées à
+    un AUTRE conducteur ne sont pas visibles. Les propositions passent
+    d'abord, puis les demandes ouvertes, par ancienneté."""
+    _require_device(x_device_token)
+    conn = get_db()
+    driver = _driver_by_id(conn, driver_id)
+    if driver is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Conducteur introuvable.")
+    if driver["status"] != "verified":
+        conn.close()
+        raise HTTPException(
+            status_code=403,
+            detail="Seul un conducteur vérifié voit les demandes.")
+    rows = conn.execute(
+        "SELECT r.*, u.full_name AS client_name, u.phone AS client_phone "
+        "FROM rides r JOIN app_users u ON u.id = r.client_id "
+        "WHERE r.status = 'requested' "
+        "AND (r.driver_id IS NULL OR r.driver_id = ?) "
+        "ORDER BY (r.driver_id = ?) DESC, r.created_at ASC LIMIT 50",
+        (driver_id, driver_id)).fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["chosen_for_me"] = d["driver_id"] == driver_id
+        out.append(d)
+    return {"requests": out}
 
 
 @app.get("/pricing/estimate")

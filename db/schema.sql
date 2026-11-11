@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS drivers (
     licence_number TEXT,
     verified_at TEXT,
     rating_avg REAL NOT NULL DEFAULT 0,
+    online INTEGER NOT NULL DEFAULT 0,
+    rejection_reason TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -44,6 +46,7 @@ CREATE TABLE IF NOT EXISTS motorcycles (
     id TEXT PRIMARY KEY,
     driver_id TEXT NOT NULL REFERENCES drivers(id) ON DELETE CASCADE,
     plate TEXT NOT NULL UNIQUE,
+    box_code TEXT UNIQUE,
     brand TEXT,
     model TEXT,
     color TEXT,

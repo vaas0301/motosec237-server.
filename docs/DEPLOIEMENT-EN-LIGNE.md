@@ -44,7 +44,7 @@ Ne jamais commiter : `.env`, `server_config.json`, `*.db`,
 
 ```bash
 curl https://motosec237-server.onrender.com/health
-# attendu : {"status":"ok","version":"0.2.0","mode":"online",...}
+# attendu : {"status":"ok","version":"0.3.0","mode":"online",...}
 curl https://motosec237-server.onrender.com/config
 ```
 

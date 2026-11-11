@@ -32,7 +32,7 @@ def test_health_online():
     assert r.status_code == 200
     assert r.json()["status"] == "ok"
     assert r.json()["mode"] == "online"
-    assert r.json()["version"] == "0.2.0"
+    assert r.json()["version"] == "0.3.0"
 
 
 def test_register_wrong_code_refused():

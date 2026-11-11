@@ -10,8 +10,8 @@ techniques (`devices`, `operations`, `otp_codes`, `audit`).
 |---|---|---|
 | `app_users` | Clients, conducteurs, admins, sécurité | PK `id` (TEXT/UUID), `phone` UNIQUE, `role`, `language` fr/en |
 | `emergency_contacts` | Proches à prévenir | FK `user_id` → `app_users` |
-| `drivers` | Conducteurs, statut de vérification | FK `user_id` UNIQUE, `status` pending/verified/suspended/rejected |
-| `motorcycles` | Motos identifiées par plaque | FK `driver_id`, `plate` UNIQUE |
+| `drivers` | Conducteurs, statut de vérification | FK `user_id` UNIQUE, `status` pending/verified/suspended/rejected, `online` 0/1, `rejection_reason`, `last_lat/lng/seen_at` (v0.3) |
+| `motorcycles` | Motos identifiées par plaque | FK `driver_id`, `plate` UNIQUE, `box_code` UNIQUE (nullable, v0.3) |
 | `rides` | Courses (brouillon → terminée) | FK client/driver/moto, `op_id` UNIQUE, `status` |
 | `parcels` | Colis, code de traçabilité unique | FK `ride_id`, `tracking_code` UNIQUE |
 | `gps_points` | Historique des positions (1 ligne / point) | FK `ride_id`, index `(ride_id, recorded_at)` |
